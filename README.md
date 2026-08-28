@@ -18,9 +18,13 @@ Each clone uses APFS `clonefile(2)` and receives a distinct MAC address and Mac
 machine identifier. VMs are headless, use NAT networking, and expose their IP
 through the host DHCP lease database.
 
+Virtualization.framework operations must run inside an unlocked Aqua session.
+RunsOn launches the CLI as a dedicated non-admin console user; calling `run`
+from a system LaunchDaemon without a GUI session fails on stock macOS images.
+
 ## Build
 
-Build on Apple Silicon with macOS 13 or newer:
+Build on Apple Silicon with macOS 14 or newer:
 
 ```bash
 swift build -c release --arch arm64
