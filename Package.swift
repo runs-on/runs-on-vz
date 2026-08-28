@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "runs-on-vz",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     products: [
         .executable(name: "runs-on-vz", targets: ["runs-on-vz"]),
     ],

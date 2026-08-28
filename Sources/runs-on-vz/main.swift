@@ -180,7 +180,7 @@ private func cloneConfig(_ source: URL, _ destination: URL) throws {
 }
 
 @MainActor
-private final class VirtualMachineSession: NSObject, VZVirtualMachineDelegate {
+private final class VirtualMachineSession: NSObject {
     let machine: VZVirtualMachine
     private var stopped = false
 
@@ -252,7 +252,9 @@ private final class VirtualMachineSession: NSObject, VZVirtualMachineDelegate {
             Task { try? await machine.stop() }
         }
     }
+}
 
+extension VirtualMachineSession: @MainActor VZVirtualMachineDelegate {
     func guestDidStop(_ virtualMachine: VZVirtualMachine) { stopped = true }
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) { stopped = true }
 }
