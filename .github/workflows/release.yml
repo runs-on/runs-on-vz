@@ -18,8 +18,10 @@ jobs:
       - name: Verify architecture
         run: file .build/arm64-apple-macosx/release/runs-on-vz | grep -q 'arm64'
       - name: Package
-        run: cp .build/arm64-apple-macosx/release/runs-on-vz runs-on-vz-darwin-arm64
+        run: |
+          cp .build/arm64-apple-macosx/release/runs-on-vz runs-on-vz-darwin-arm64
+          shasum -a 256 runs-on-vz-darwin-arm64 > runs-on-vz-darwin-arm64.sha256
       - name: Publish unsigned binary
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" runs-on-vz-darwin-arm64 --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" runs-on-vz-darwin-arm64 runs-on-vz-darwin-arm64.sha256 --generate-notes

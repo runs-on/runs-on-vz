@@ -209,6 +209,9 @@ private final class VirtualMachineSession: NSObject, VZVirtualMachineDelegate {
         graphics.displays = [VZMacGraphicsDisplayConfiguration(widthInPixels: imageConfig.width, heightInPixels: imageConfig.height, pixelsPerInch: 80)]
         configuration.graphicsDevices = [graphics]
 
+        configuration.keyboards = [VZMacKeyboardConfiguration()]
+        configuration.pointingDevices = [VZMacTrackpadConfiguration()]
+
         let sound = VZVirtioSoundDeviceConfiguration()
         sound.streams = [VZVirtioSoundDeviceOutputStreamConfiguration()]
         configuration.audioDevices = [sound]
@@ -221,6 +224,12 @@ private final class VirtualMachineSession: NSObject, VZVirtualMachineDelegate {
         let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: directory.disk, readOnly: false, cachingMode: .automatic, synchronizationMode: .full)
         configuration.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        let consolePort = VZVirtioConsolePortConfiguration()
+        consolePort.name = "runs-on-vz"
+        let console = VZVirtioConsoleDeviceConfiguration()
+        console.ports[0] = consolePort
+        configuration.consoleDevices = [console]
+        configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         try configuration.validate()
 
         machine = VZVirtualMachine(configuration: configuration)
