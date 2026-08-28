@@ -254,9 +254,14 @@ private final class VirtualMachineSession: NSObject {
     }
 }
 
-extension VirtualMachineSession: @MainActor VZVirtualMachineDelegate {
-    func guestDidStop(_ virtualMachine: VZVirtualMachine) { stopped = true }
-    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) { stopped = true }
+extension VirtualMachineSession: VZVirtualMachineDelegate {
+    nonisolated func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        Task { @MainActor in stopped = true }
+    }
+
+    nonisolated func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
+        Task { @MainActor in stopped = true }
+    }
 }
 
 private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int) throws {
