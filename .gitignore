@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+*.xcodeproj/
+runs-on-vz-darwin-arm64

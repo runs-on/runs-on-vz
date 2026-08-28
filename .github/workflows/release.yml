@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build arm64 release
+        run: swift build -c release --arch arm64
+      - name: Verify architecture
+        run: file .build/arm64-apple-macosx/release/runs-on-vz | grep -q 'arm64'
+      - name: Package
+        run: cp .build/arm64-apple-macosx/release/runs-on-vz runs-on-vz-darwin-arm64
+      - name: Publish unsigned binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" runs-on-vz-darwin-arm64 --generate-notes
