@@ -354,16 +354,31 @@ private func findIPAddress(directory: VMDirectory, timeoutSeconds: Int = 120) th
 }
 
 private func addressFromLeases(_ contents: String, macAddress: String) -> String? {
+    guard let wantedMAC = normalizedMACAddress(macAddress) else { return nil }
     for block in contents.components(separatedBy: "}") {
         var fields: [String: String] = [:]
         for line in block.split(separator: "\n") {
             let parts = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             if parts.count == 2 { fields[parts[0]] = parts[1] }
         }
-        let leaseMAC = fields["hw_address"]?.split(separator: ",", maxSplits: 1).last.map(String.init)?.lowercased()
-        if leaseMAC == macAddress, let address = fields["ip_address"], !address.isEmpty { return address }
+        let leaseMAC = fields["hw_address"]?.split(separator: ",", maxSplits: 1).last.flatMap {
+            normalizedMACAddress(String($0))
+        }
+        if leaseMAC == wantedMAC, let address = fields["ip_address"], !address.isEmpty { return address }
     }
     return nil
+}
+
+func normalizedMACAddress(_ address: String) -> String? {
+    let octets = address.split(separator: ":", omittingEmptySubsequences: false)
+    guard octets.count == 6 else { return nil }
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(6)
+    for octet in octets {
+        guard !octet.isEmpty, octet.count <= 2, let byte = UInt8(octet, radix: 16) else { return nil }
+        bytes.append(byte)
+    }
+    return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
 }
 
 private func readPID(_ url: URL) -> pid_t? {

@@ -10,5 +10,6 @@ let package = Package(
     ],
     targets: [
         .executableTarget(name: "runs-on-vz"),
+        .testTarget(name: "runs-on-vzTests", dependencies: ["runs-on-vz"]),
     ]
 )

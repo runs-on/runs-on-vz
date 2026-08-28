@@ -13,6 +13,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
+      - name: Test
+        run: swift test
       - name: Build arm64 release
         run: swift build -c release --arch arm64
       - name: Verify architecture
