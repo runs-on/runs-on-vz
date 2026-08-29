@@ -4,6 +4,19 @@ import Virtualization
 @testable import runs_on_vz
 
 final class CloneConfigTests: XCTestCase {
+    func testCloneDestinationUsesExclusivePOSIXDirectoryCreation() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        let destination = root.appendingPathComponent("clone")
+
+        try createCloneDestination(destination)
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertThrowsError(try createCloneDestination(destination))
+    }
+
     func testClonePreservesMachineIdentifierAndRegeneratesMACAddress() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

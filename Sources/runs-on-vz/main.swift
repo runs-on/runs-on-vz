@@ -148,11 +148,7 @@ private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
     guard !FileManager.default.fileExists(atPath: destination.url.path) else {
         throw CLIError(code: .configuration, kind: "destination_exists", message: "destination already exists: \(destination.url.path)")
     }
-    do {
-        try FileManager.default.createDirectory(at: destination.url, withIntermediateDirectories: false)
-    } catch {
-        throw CLIError(code: .io, kind: "create_destination", message: "create \(destination.url.path): \(error.localizedDescription)")
-    }
+    try createCloneDestination(destination.url)
     do {
         try cloneFile(source.disk, destination.disk)
         try cloneFile(source.nvram, destination.nvram)
@@ -161,6 +157,13 @@ private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
     } catch {
         try? FileManager.default.removeItem(at: destination.url)
         throw error
+    }
+}
+
+func createCloneDestination(_ destination: URL) throws {
+    let result = destination.path.withCString { mkdir($0, 0o755) }
+    if result != 0 {
+        throw CLIError(code: .io, kind: "create_destination", message: "create \(destination.path): \(String(cString: strerror(errno)))")
     }
 }
 
