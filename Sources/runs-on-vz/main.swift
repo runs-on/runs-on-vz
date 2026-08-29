@@ -157,9 +157,25 @@ private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
         try cloneFile(source.disk, destination.disk)
         try cloneFile(source.nvram, destination.nvram)
         try cloneConfig(source.config, destination.config)
+        try inheritCloneOwnership(destination, from: destination.url.deletingLastPathComponent())
     } catch {
         try? FileManager.default.removeItem(at: destination.url)
         throw error
+    }
+}
+
+private func inheritCloneOwnership(_ destination: VMDirectory, from parent: URL) throws {
+    let attributes = try FileManager.default.attributesOfItem(atPath: parent.path)
+    guard let uid = attributes[.ownerAccountID] as? NSNumber,
+          let gid = attributes[.groupOwnerAccountID] as? NSNumber else {
+        throw CLIError(code: .io, kind: "clone_ownership", message: "read owner of \(parent.path)")
+    }
+    let ownership: [FileAttributeKey: Any] = [
+        .ownerAccountID: uid,
+        .groupOwnerAccountID: gid,
+    ]
+    for item in [destination.url, destination.config, destination.disk, destination.nvram] {
+        try FileManager.default.setAttributes(ownership, ofItemAtPath: item.path)
     }
 }
 
