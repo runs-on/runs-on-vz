@@ -169,7 +169,7 @@ private func cloneFile(_ source: URL, _ destination: URL) throws {
     }
 }
 
-private func cloneConfig(_ source: URL, _ destination: URL) throws {
+func cloneConfig(_ source: URL, _ destination: URL) throws {
     let data = try Data(contentsOf: source)
     guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         throw CLIError(code: .configuration, kind: "invalid_config", message: "config.json is not a JSON object")
