@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - auto/macos
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test
+        run: swift test
+      - name: Build arm64 release
+        run: swift build -c release --arch arm64
+      - name: Verify architecture
+        run: file .build/arm64-apple-macosx/release/runs-on-vz | grep -q arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runs-on-vz-darwin-arm64
+          path: .build/arm64-apple-macosx/release/runs-on-vz
+          if-no-files-found: error

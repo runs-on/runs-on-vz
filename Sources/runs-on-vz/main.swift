@@ -1,4 +1,5 @@
 import Darwin
+import AppKit
 import Foundation
 @preconcurrency import Virtualization
 
@@ -174,7 +175,6 @@ private func cloneConfig(_ source: URL, _ destination: URL) throws {
         throw CLIError(code: .configuration, kind: "invalid_config", message: "config.json is not a JSON object")
     }
     json["macAddress"] = VZMACAddress.randomLocallyAdministered().string
-    json["ecid"] = VZMacMachineIdentifier().dataRepresentation.base64EncodedString()
     let encoded = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     try encoded.write(to: destination, options: .atomic)
 }
@@ -202,15 +202,20 @@ private final class VirtualMachineSession: NSObject {
         let platform = VZMacPlatformConfiguration()
         platform.hardwareModel = imageConfig.hardwareModel
         platform.machineIdentifier = imageConfig.machineIdentifier
-        platform.auxiliaryStorage = VZMacAuxiliaryStorage(contentsOf: directory.nvram)
+        platform.auxiliaryStorage = VZMacAuxiliaryStorage(url: directory.nvram)
         configuration.platform = platform
 
         let graphics = VZMacGraphicsDeviceConfiguration()
-        graphics.displays = [VZMacGraphicsDisplayConfiguration(widthInPixels: imageConfig.width, heightInPixels: imageConfig.height, pixelsPerInch: 80)]
+        if let screen = NSScreen.main {
+            let size = NSSize(width: imageConfig.width, height: imageConfig.height)
+            graphics.displays = [VZMacGraphicsDisplayConfiguration(for: screen, sizeInPoints: size)]
+        } else {
+            graphics.displays = [VZMacGraphicsDisplayConfiguration(widthInPixels: imageConfig.width, heightInPixels: imageConfig.height, pixelsPerInch: 72)]
+        }
         configuration.graphicsDevices = [graphics]
 
-        configuration.keyboards = [VZMacKeyboardConfiguration()]
-        configuration.pointingDevices = [VZMacTrackpadConfiguration()]
+        configuration.keyboards = [VZUSBKeyboardConfiguration(), VZMacKeyboardConfiguration()]
+        configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration(), VZMacTrackpadConfiguration()]
 
         let sound = VZVirtioSoundDeviceConfiguration()
         sound.streams = [VZVirtioSoundDeviceOutputStreamConfiguration()]
@@ -224,11 +229,20 @@ private final class VirtualMachineSession: NSObject {
         let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: directory.disk, readOnly: false, cachingMode: .automatic, synchronizationMode: .full)
         configuration.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+        let spicePort = VZVirtioConsolePortConfiguration()
+        spicePort.name = VZSpiceAgentPortAttachment.spiceAgentPortName
+        let spiceAttachment = VZSpiceAgentPortAttachment()
+        spiceAttachment.sharesClipboard = true
+        spicePort.attachment = spiceAttachment
+        let spiceConsole = VZVirtioConsoleDeviceConfiguration()
+        spiceConsole.ports[0] = spicePort
+
         let consolePort = VZVirtioConsolePortConfiguration()
         consolePort.name = "runs-on-vz"
         let console = VZVirtioConsoleDeviceConfiguration()
         console.ports[0] = consolePort
-        configuration.consoleDevices = [console]
+        configuration.consoleDevices = [spiceConsole, console]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         try configuration.validate()
 
