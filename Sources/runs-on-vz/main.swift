@@ -165,10 +165,11 @@ private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
 }
 
 private func inheritCloneOwnership(_ destination: VMDirectory, from parent: URL) throws {
-    let attributes = try FileManager.default.attributesOfItem(atPath: parent.path)
+    let ownershipParent = resolvedCloneOwnershipParent(parent)
+    let attributes = try FileManager.default.attributesOfItem(atPath: ownershipParent.path)
     guard let uid = attributes[.ownerAccountID] as? NSNumber,
           let gid = attributes[.groupOwnerAccountID] as? NSNumber else {
-        throw CLIError(code: .io, kind: "clone_ownership", message: "read owner of \(parent.path)")
+        throw CLIError(code: .io, kind: "clone_ownership", message: "read owner of \(ownershipParent.path)")
     }
     let ownership: [FileAttributeKey: Any] = [
         .ownerAccountID: uid,
@@ -177,6 +178,10 @@ private func inheritCloneOwnership(_ destination: VMDirectory, from parent: URL)
     for item in [destination.url, destination.config, destination.disk, destination.nvram] {
         try FileManager.default.setAttributes(ownership, ofItemAtPath: item.path)
     }
+}
+
+func resolvedCloneOwnershipParent(_ parent: URL) -> URL {
+    parent.resolvingSymlinksInPath()
 }
 
 private func cloneFile(_ source: URL, _ destination: URL) throws {
