@@ -239,7 +239,9 @@ private final class VirtualMachineSession: NSObject {
         spiceConsole.ports[0] = spicePort
 
         let consolePort = VZVirtioConsolePortConfiguration()
-        consolePort.name = "runs-on-vz"
+        // Cirrus runner images establish their AppleVirtualPlatform identity
+        // with this compatibility device present in Tart's VM topology.
+        consolePort.name = "tart-version-2.34.0"
         let console = VZVirtioConsoleDeviceConfiguration()
         console.ports[0] = consolePort
         configuration.consoleDevices = [spiceConsole, console]
