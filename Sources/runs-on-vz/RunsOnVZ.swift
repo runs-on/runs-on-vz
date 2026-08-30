@@ -183,9 +183,10 @@ private func cloneConfig(_ source: URL, _ destination: URL) throws {
 @MainActor
 private final class VirtualMachineSession: NSObject {
     let machine: VZVirtualMachine
+    private var bootstrapChannel: BootstrapChannel?
     private var stopped = false
 
-    init(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapDirectory: String?) throws {
+    init(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
         let imageConfig = try VMConfig(url: directory.config)
         guard cpus >= imageConfig.cpuCountMin else {
             throw CLIError(code: .configuration, kind: "insufficient_cpu", message: "VM requires at least \(imageConfig.cpuCountMin) CPUs")
@@ -231,14 +232,19 @@ private final class VirtualMachineSession: NSObject {
         console.ports[0] = consolePort
         configuration.consoleDevices = [console]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
-        if let bootstrapDirectory {
-            configuration.directorySharingDevices = [try bootstrapShare(bootstrapDirectory)]
-        }
         try configuration.validate()
 
         machine = VZVirtualMachine(configuration: configuration)
         super.init()
         machine.delegate = self
+        if let bootstrapFile {
+            let channel = try BootstrapChannel(path: bootstrapFile)
+            guard let socket = machine.socketDevices.first as? VZVirtioSocketDevice else {
+                throw CLIError(code: .configuration, kind: "missing_socket", message: "VM socket device is unavailable")
+            }
+            socket.setSocketListener(channel.listener, forPort: 1024)
+            bootstrapChannel = channel
+        }
     }
 
     func run() async throws {
@@ -269,7 +275,7 @@ extension VirtualMachineSession: VZVirtualMachineDelegate {
     }
 }
 
-private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapDirectory: String?) throws {
+private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
     try directory.validate()
     if let pid = readPID(directory.pid), processExists(pid) {
         throw CLIError(code: .unavailable, kind: "already_running", message: "VM is already running with pid \(pid)")
@@ -282,8 +288,8 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
     let process = Process()
     process.executableURL = executableURL()
     process.arguments = ["internal-run", "--vm", directory.url.path, "--cpus", String(cpus), "--memory-mib", String(memoryMiB)]
-    if let bootstrapDirectory {
-        process.arguments?.append(contentsOf: ["--bootstrap-directory", bootstrapDirectory])
+    if let bootstrapFile {
+        process.arguments?.append(contentsOf: ["--bootstrap-file", bootstrapFile])
     }
     process.standardOutput = log
     process.standardError = log
@@ -308,8 +314,8 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
 }
 
 @MainActor
-private func runForeground(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapDirectory: String?) async throws {
-    let session = try VirtualMachineSession(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapDirectory: bootstrapDirectory)
+private func runForeground(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) async throws {
+    let session = try VirtualMachineSession(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -433,17 +439,17 @@ private enum RunsOnVZ {
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
                 let cpus = try arguments.integer("--cpus")
                 let memoryMiB = try arguments.integer("--memory-mib")
-                let bootstrapDirectory = arguments.optional("--bootstrap-directory")
+                let bootstrapFile = arguments.optional("--bootstrap-file")
                 if arguments.has("--detach") {
-                    try startDetached(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapDirectory: bootstrapDirectory)
+                    try startDetached(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
                     JSONOutput.success()
                 } else {
-                    try await runForeground(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapDirectory: bootstrapDirectory)
+                    try await runForeground(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
                     JSONOutput.success()
                 }
             case "internal-run":
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
-                try await runForeground(directory: directory, cpus: try arguments.integer("--cpus"), memoryMiB: try arguments.integer("--memory-mib"), bootstrapDirectory: arguments.optional("--bootstrap-directory"))
+                try await runForeground(directory: directory, cpus: try arguments.integer("--cpus"), memoryMiB: try arguments.integer("--memory-mib"), bootstrapFile: arguments.optional("--bootstrap-file"))
             case "ip":
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
                 JSONOutput.success(["ip": try findIPAddress(directory: directory)])
