@@ -277,8 +277,8 @@ extension VirtualMachineSession: VZVirtualMachineDelegate {
 
 private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
     try directory.validate()
-    if let pid = readPID(directory.pid), processExists(pid) {
-        throw CLIError(code: .unavailable, kind: "already_running", message: "VM is already running with pid \(pid)")
+    if let identity = try ProcessIdentity.read(directory.pid), try identity.isRunning() {
+        throw CLIError(code: .unavailable, kind: "already_running", message: "VM is already running")
     }
     try? FileManager.default.removeItem(at: directory.pid)
     FileManager.default.createFile(atPath: directory.log.path, contents: nil)
@@ -293,13 +293,23 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
     }
     process.standardOutput = log
     process.standardError = log
+    let gate = Pipe()
+    process.standardInput = gate
+    defer { try? gate.fileHandleForWriting.close() }
     do {
         try process.run()
     } catch {
         try? log.close()
         throw CLIError(code: .software, kind: "start_process", message: "start VM process: \(error.localizedDescription)")
     }
-    try Data("\(process.processIdentifier)\n".utf8).write(to: directory.pid, options: .atomic)
+    guard let identity = try ProcessIdentity.current(process.processIdentifier) else {
+        throw CLIError(code: .software, kind: "process_identity", message: "VM child exited before startup")
+    }
+    try identity.write(directory.pid)
+    // EOF without this gate means the launcher died before recording the
+    // child. Such a child must exit without touching Virtualization.framework.
+    try gate.fileHandleForWriting.write(contentsOf: Data("start\n".utf8))
+    try gate.fileHandleForWriting.close()
     try? log.close()
 
     for _ in 0..<100 {
@@ -311,10 +321,17 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
         }
         usleep(50_000)
     }
+    throw CLIError(code: .software, kind: "start_timeout", message: "VM did not report startup; see \(directory.log.path)")
 }
 
 @MainActor
 private func runForeground(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) async throws {
+    guard let identity = try ProcessIdentity.current(getpid()) else {
+        throw CLIError(code: .software, kind: "process_identity", message: "cannot identify VM process")
+    }
+    // Record the child before any VM side effect, including when its parent
+    // dies during startup. Keep the identity until stop has observed exit.
+    try identity.write(directory.pid)
     let session = try VirtualMachineSession(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
@@ -327,16 +344,16 @@ private func runForeground(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
     defer {
         term.cancel()
         interrupt.cancel()
-        if readPID(directory.pid) == getpid() { try? FileManager.default.removeItem(at: directory.pid) }
     }
     try await session.run()
 }
 
 private func stopVM(directory: VMDirectory, graceSeconds: Int) throws {
-    guard let pid = readPID(directory.pid) else {
+    guard let identity = try ProcessIdentity.read(directory.pid) else {
         return
     }
-    guard processExists(pid) else {
+    let pid = identity.pid
+    guard try identity.isRunning() else {
         try? FileManager.default.removeItem(at: directory.pid)
         return
     }
@@ -345,16 +362,28 @@ private func stopVM(directory: VMDirectory, graceSeconds: Int) throws {
     }
     let deadline = Date().addingTimeInterval(TimeInterval(graceSeconds))
     while Date() < deadline {
-        if !processExists(pid) {
+        if try !identity.isRunning() {
             try? FileManager.default.removeItem(at: directory.pid)
             return
         }
         usleep(100_000)
     }
-    if kill(pid, SIGKILL) != 0 && errno != ESRCH {
+    if try identity.isRunning(), kill(pid, SIGKILL) != 0 && errno != ESRCH {
         throw CLIError(code: .software, kind: "force_stop", message: "force-stop VM process \(pid): \(String(cString: strerror(errno)))")
     }
+    let killDeadline = Date().addingTimeInterval(5)
+    while try identity.isRunning() && Date() < killDeadline { usleep(100_000) }
+    guard try !identity.isRunning() else {
+        throw CLIError(code: .software, kind: "stop_timeout", message: "VM process did not exit after force-stop")
+    }
     try? FileManager.default.removeItem(at: directory.pid)
+}
+
+private func waitVM(directory: VMDirectory) throws {
+    guard let identity = try ProcessIdentity.read(directory.pid) else {
+        throw CLIError(code: .software, kind: "process_identity", message: "VM process identity is missing")
+    }
+    while try identity.isRunning() { usleep(100_000) }
 }
 
 private func findIPAddress(directory: VMDirectory, timeoutSeconds: Int = 120) throws -> String {
@@ -399,11 +428,6 @@ func normalizedMACAddress(_ address: String) -> String? {
     return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
 }
 
-private func readPID(_ url: URL) -> pid_t? {
-    guard let text = try? String(contentsOf: url, encoding: .utf8), let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), value > 1 else { return nil }
-    return value
-}
-
 private func processExists(_ pid: pid_t) -> Bool {
     kill(pid, 0) == 0 || errno == EPERM
 }
@@ -425,7 +449,7 @@ private enum RunsOnVZ {
     static func main() async {
         do {
             guard CommandLine.arguments.count >= 2 else {
-                throw CLIError(code: .usage, kind: "missing_command", message: "usage: runs-on-vz <clone|run|ip|stop|delete> [options]")
+                throw CLIError(code: .usage, kind: "missing_command", message: "usage: runs-on-vz <clone|run|wait|ip|stop|delete> [options]")
             }
             let command = CommandLine.arguments[1]
             let arguments = try Arguments(CommandLine.arguments.dropFirst(2))
@@ -448,8 +472,14 @@ private enum RunsOnVZ {
                     JSONOutput.success()
                 }
             case "internal-run":
+                guard readLine() == "start" else {
+                    throw CLIError(code: .software, kind: "start_cancelled", message: "VM launcher did not authorize startup")
+                }
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
                 try await runForeground(directory: directory, cpus: try arguments.integer("--cpus"), memoryMiB: try arguments.integer("--memory-mib"), bootstrapFile: arguments.optional("--bootstrap-file"))
+            case "wait":
+                try waitVM(directory: VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm"))))
+                JSONOutput.success()
             case "ip":
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
                 JSONOutput.success(["ip": try findIPAddress(directory: directory)])

@@ -11,6 +11,7 @@ runs-on-vz clone --source IMAGE --destination VM --slot 0 --json
 runs-on-vz run --vm VM --cpus 6 --memory-mib 15360 --detach --json
 runs-on-vz run --vm VM --cpus 4 --memory-mib 8192 --bootstrap-file EXECUTION_DIR/channel.json --detach --json
 runs-on-vz ip --vm VM --json
+runs-on-vz wait --vm VM --json
 runs-on-vz stop --vm VM --grace-seconds 30 --json
 runs-on-vz delete --vm VM --json
 ```
@@ -29,6 +30,12 @@ The guest connects to `VMADDR_CID_HOST` (2), port 1024. Payloads must be nonempt
 regular files of at most 64 KiB; symlinks are rejected. Each listener permits
 at most eight concurrent replies, with a five-second socket write timeout.
 Never include host credentials or another execution's data in the snapshot.
+
+`wait` observes process exit without contacting the guest. Process records
+contain both the PID and its kernel start time, so recovery never treats a
+reused PID as the VM. `stop` confirms exit before removing that record. A
+detached child cannot start its VM until its parent durably records its identity.
+Malformed process records fail closed; inspect them before manual cleanup.
 
 The socket replaces virtiofs bootstrap, which macOS privacy protection blocks
 when accessed by a daemon at cold boot. Two simultaneous Sequoia 15.6.1 guests
