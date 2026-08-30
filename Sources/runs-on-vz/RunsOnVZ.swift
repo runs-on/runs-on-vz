@@ -243,6 +243,7 @@ private final class VirtualMachineSession: NSObject {
 
     func run() async throws {
         try await machine.start(options: VZMacOSVirtualMachineStartOptions())
+        FileHandle.standardError.write(Data("runs-on-vz: started\n".utf8))
         while !stopped && machine.state != .stopped && machine.state != .error {
             try await Task.sleep(for: .milliseconds(250))
         }
@@ -322,7 +323,6 @@ private func runForeground(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
         interrupt.cancel()
         if readPID(directory.pid) == getpid() { try? FileManager.default.removeItem(at: directory.pid) }
     }
-    FileHandle.standardError.write(Data("runs-on-vz: started\n".utf8))
     try await session.run()
 }
 
