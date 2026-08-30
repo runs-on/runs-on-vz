@@ -22,9 +22,10 @@ through the host DHCP lease database.
 `--bootstrap-directory` exposes exactly one host-owned directory through the
 read-only `runs-on-bootstrap` virtiofs share. Use a new directory for each
 execution, never a reusable slot directory. The guest mounts this share to
-read its bootstrap and renewable credentials. The host may atomically replace
-files; the guest cannot write back. Do not include symlinks, host credentials,
-or other jobs' files in this directory.
+read its bootstrap and renewable credentials. The guest cannot write back.
+Publish updates under new, immutable filenames: macOS guests can retain a
+deleted inode after host-side atomic replacement of an existing path. Do not
+include symlinks, host credentials, or other jobs' files in this directory.
 
 Virtualization.framework operations must run inside an unlocked Aqua session.
 RunsOn launches the CLI as a dedicated non-admin console user; calling `run`
