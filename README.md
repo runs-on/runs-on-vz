@@ -9,6 +9,7 @@ The CLI is intentionally narrow and machine-oriented:
 ```text
 runs-on-vz clone --source IMAGE --destination VM --slot 0 --json
 runs-on-vz run --vm VM --cpus 6 --memory-mib 15360 --detach --json
+runs-on-vz run --vm VM --cpus 4 --memory-mib 8192 --bootstrap-directory EXECUTION_DIR --detach --json
 runs-on-vz ip --vm VM --json
 runs-on-vz stop --vm VM --grace-seconds 30 --json
 runs-on-vz delete --vm VM --json
@@ -17,6 +18,13 @@ runs-on-vz delete --vm VM --json
 Each clone uses APFS `clonefile(2)` and receives a distinct MAC address and Mac
 machine identifier. VMs are headless, use NAT networking, and expose their IP
 through the host DHCP lease database.
+
+`--bootstrap-directory` exposes exactly one host-owned directory through the
+read-only `runs-on-bootstrap` virtiofs share. Use a new directory for each
+execution, never a reusable slot directory. The guest mounts this share to
+read its bootstrap and renewable credentials. The host may atomically replace
+files; the guest cannot write back. Do not include symlinks, host credentials,
+or other jobs' files in this directory.
 
 Virtualization.framework operations must run inside an unlocked Aqua session.
 RunsOn launches the CLI as a dedicated non-admin console user; calling `run`
