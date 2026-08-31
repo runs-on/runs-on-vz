@@ -1,0 +1,24 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit tests
+        run: swift test
+      - name: Build arm64 runtime
+        run: swift build -c release --arch arm64
+      - name: Test process recovery without starting VMs
+        run: |
+          swiftc Sources/runs-on-vz/ProcessIdentity.swift Scripts/process-identity-smoke.swift -o "$RUNNER_TEMP/process-identity-smoke"
+          "$RUNNER_TEMP/process-identity-smoke" "$PWD/.build/arm64-apple-macosx/release/runs-on-vz"

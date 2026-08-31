@@ -56,3 +56,20 @@ swift build -c release --arch arm64
 
 Release binaries are unsigned. The RunsOn host agent applies an ad-hoc
 signature with the virtualization entitlement before first use.
+
+## Tests
+
+`swift test` requires full Xcode, including XCTest. The `Test` workflow runs
+unit tests, builds the runtime and checks process recovery on a GitHub-hosted
+Mac for every branch and pull request. It does not start a VM.
+
+With Command Line Tools alone, build the runtime and run the process check:
+
+```bash
+swift build -c release --arch arm64
+swiftc Sources/runs-on-vz/ProcessIdentity.swift Scripts/process-identity-smoke.swift -o /tmp/process-identity-smoke
+/tmp/process-identity-smoke "$PWD/.build/arm64-apple-macosx/release/runs-on-vz"
+```
+
+The check creates and stops its own temporary sleep process. It verifies
+process identity, stale PID protection, waiting, stopping and record cleanup.
