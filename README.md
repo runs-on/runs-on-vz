@@ -65,6 +65,11 @@ swift build -c release --arch arm64
 Release binaries are unsigned. The RunsOn host agent applies an ad-hoc
 signature with the virtualization entitlement before first use.
 
+The release workflow reruns unit, process and lifecycle checks before publishing
+the arm64 binary and its SHA-256 file. Tags containing a prerelease suffix,
+such as `v0.2.0-rc.1`, publish a prerelease without changing the latest stable
+release. Publication requires an existing remote tag.
+
 ## Tests
 
 `swift test` requires full Xcode, including XCTest. The `Test` workflow runs

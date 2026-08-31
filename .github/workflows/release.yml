@@ -11,14 +11,23 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Test
         run: swift test
       - name: Build arm64 release
         run: swift build -c release --arch arm64
       - name: Verify architecture
         run: file .build/arm64-apple-macosx/release/runs-on-vz | grep -q 'arm64'
+      - name: Test process recovery without starting VMs
+        run: |
+          swiftc Sources/runs-on-vz/ProcessIdentity.swift Scripts/process-identity-smoke.swift -o "$RUNNER_TEMP/process-identity-smoke"
+          "$RUNNER_TEMP/process-identity-smoke" "$PWD/.build/arm64-apple-macosx/release/runs-on-vz"
+      - name: Test lifecycle serialization and fresh clones without starting VMs
+        run: |
+          swiftc -parse-as-library Scripts/lifecycle-smoke.swift -o "$RUNNER_TEMP/lifecycle-smoke"
+          "$RUNNER_TEMP/lifecycle-smoke" "$PWD/.build/arm64-apple-macosx/release/runs-on-vz"
       - name: Package
         run: |
           cp .build/arm64-apple-macosx/release/runs-on-vz runs-on-vz-darwin-arm64
@@ -26,4 +35,9 @@ jobs:
       - name: Publish unsigned binary
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" runs-on-vz-darwin-arm64 runs-on-vz-darwin-arm64.sha256 --generate-notes
+        run: |
+          flags=(--verify-tag --generate-notes)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" runs-on-vz-darwin-arm64 runs-on-vz-darwin-arm64.sha256 "${flags[@]}"
