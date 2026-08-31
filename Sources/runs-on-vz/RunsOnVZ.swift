@@ -148,19 +148,14 @@ private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
     guard !FileManager.default.fileExists(atPath: destination.url.path) else {
         throw CLIError(code: .configuration, kind: "destination_exists", message: "destination already exists: \(destination.url.path)")
     }
-    // mkdir, unlike FileManager.createDirectory, rejects an existing directory.
-    // A losing concurrent clone must never clean up the winner's files.
-    guard mkdir(destination.url.path, 0o700) == 0 else {
-        throw CLIError(code: .io, kind: "create_destination", message: "create \(destination.url.path): \(String(cString: strerror(errno)))")
-    }
-    let lock = try VMDirectoryLock(destination.url)
+    let lock = try VMDirectoryLock.create(destination.url)
     defer { lock.release() }
     do {
         try cloneFile(source.disk, destination.disk)
         try cloneFile(source.nvram, destination.nvram)
         try cloneConfig(source.config, destination.config)
     } catch {
-        try? FileManager.default.removeItem(at: destination.url)
+        try? lock.removeDirectory()
         throw error
     }
 }
@@ -404,7 +399,7 @@ private func cleanupVM(directory: VMDirectory, graceSeconds: Int, delete: Bool) 
     }
     defer { lock.release() }
     try stopVM(directory: directory, graceSeconds: graceSeconds)
-    if delete { try FileManager.default.removeItem(at: directory.url) }
+    if delete { try lock.removeDirectory() }
 }
 
 private func waitVM(directory: VMDirectory) throws {

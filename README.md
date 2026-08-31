@@ -40,7 +40,9 @@ Malformed process records fail closed; inspect them before manual cleanup.
 Clone, start, stop and delete serialize through a kernel lock on the VM directory.
 A waiter verifies the directory inode after acquiring that lock; a replacement
 at the same path is not the same VM. Clone directory creation is exclusive, so
-a losing clone cannot remove another clone's files. The host agent sets the
+a losing clone cannot remove another clone's files. A short parent-directory
+lock protects creation through opening the new inode, and directory removal.
+It is not held during VM startup or shutdown. The host agent sets the
 clone's owner explicitly before starting the dedicated console user's runtime.
 
 The socket replaces virtiofs bootstrap, which macOS privacy protection blocks
