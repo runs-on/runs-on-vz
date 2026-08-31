@@ -37,6 +37,12 @@ reused PID as the VM. `stop` confirms exit before removing that record. A
 detached child cannot start its VM until its parent durably records its identity.
 Malformed process records fail closed; inspect them before manual cleanup.
 
+Clone, start, stop and delete serialize through a kernel lock on the VM directory.
+A waiter verifies the directory inode after acquiring that lock; a replacement
+at the same path is not the same VM. Clone directory creation is exclusive, so
+a losing clone cannot remove another clone's files. The host agent sets the
+clone's owner explicitly before starting the dedicated console user's runtime.
+
 The socket replaces virtiofs bootstrap, which macOS privacy protection blocks
 when accessed by a daemon at cold boot. Two simultaneous Sequoia 15.6.1 guests
 successfully read distinct harmless markers from their own sockets at boot.
@@ -73,3 +79,12 @@ swiftc Sources/runs-on-vz/ProcessIdentity.swift Scripts/process-identity-smoke.s
 
 The check creates and stops its own temporary sleep process. It verifies
 process identity, stale PID protection, waiting, stopping and record cleanup.
+
+The lifecycle check uses invalid bundles that cannot pass VM configuration
+validation. It checks command serialization, replacement protection, launcher
+authorization, concurrent clones, distinct identities and isolated disk writes:
+
+```bash
+swiftc -parse-as-library Scripts/lifecycle-smoke.swift -o /tmp/lifecycle-smoke
+/tmp/lifecycle-smoke "$PWD/.build/arm64-apple-macosx/release/runs-on-vz"
+```

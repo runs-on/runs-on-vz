@@ -22,3 +22,7 @@ jobs:
         run: |
           swiftc Sources/runs-on-vz/ProcessIdentity.swift Scripts/process-identity-smoke.swift -o "$RUNNER_TEMP/process-identity-smoke"
           "$RUNNER_TEMP/process-identity-smoke" "$PWD/.build/arm64-apple-macosx/release/runs-on-vz"
+      - name: Test lifecycle serialization and fresh clones without starting VMs
+        run: |
+          swiftc -parse-as-library Scripts/lifecycle-smoke.swift -o "$RUNNER_TEMP/lifecycle-smoke"
+          "$RUNNER_TEMP/lifecycle-smoke" "$PWD/.build/arm64-apple-macosx/release/runs-on-vz"
