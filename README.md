@@ -35,11 +35,13 @@ regular files of at most 64 KiB; symlinks are rejected. Each listener permits
 at most eight concurrent replies, with a five-second socket write timeout.
 Never include host credentials or another execution's data in the snapshot.
 
-`wait` observes process exit without contacting the guest. Process records
-contain both the PID and its kernel start time, so recovery never treats a
-reused PID as the VM. `stop` confirms exit before removing that record. A
-detached child cannot start its VM until its parent durably records its identity.
-Malformed process records fail closed; inspect them before manual cleanup.
+`wait` observes process exit without contacting the guest. The runtime writes a
+terminal result before a clean or failed VM process exits. Missing, malformed,
+or mismatched results fail instead of turning crashes into successful waits.
+Process records contain both the PID and its kernel start time, so recovery never
+treats a reused PID as the VM. `stop` confirms exit before removing that record.
+A detached child cannot start its VM until its parent durably records its
+identity. Malformed process records fail closed; inspect them before cleanup.
 
 Clone, start, stop and delete serialize through a kernel lock on the VM directory.
 A waiter verifies the directory inode after acquiring that lock; a replacement

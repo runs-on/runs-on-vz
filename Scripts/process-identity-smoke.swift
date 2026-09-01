@@ -21,6 +21,7 @@ struct ProcessIdentitySmoke {
         try command("stop", directory)
         guard child.isRunning else { fatalError("stopped unrelated process") }
         try identity.write(record)
+        try RunResult(identity: identity, failure: nil).write(directory.appendingPathComponent("run.result"))
         guard try ProcessIdentity.read(record) == identity else { fatalError("identity did not round trip") }
         let waiter = try launch("wait", directory)
         usleep(100_000)
@@ -31,6 +32,21 @@ struct ProcessIdentitySmoke {
         guard waiter.terminationStatus == 0 else { fatalError("wait failed") }
         guard try !identity.isRunning() else { fatalError("stop returned with process alive") }
         guard try ProcessIdentity.read(record) == nil else { fatalError("stop retained process record") }
+
+        let crashed = Process()
+        crashed.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        crashed.arguments = ["30"]
+        try crashed.run()
+        guard let crashedIdentity = try ProcessIdentity.current(crashed.processIdentifier) else { fatalError("missing crash identity") }
+        try crashedIdentity.write(record)
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("run.result"))
+        let crashWaiter = try launch("wait", directory)
+        usleep(100_000)
+        crashed.terminate()
+        crashed.waitUntilExit()
+        crashWaiter.waitUntilExit()
+        guard crashWaiter.terminationStatus != 0 else { fatalError("wait accepted an exit without a result") }
+
         try Data("malformed".utf8).write(to: record)
         do { _ = try ProcessIdentity.read(record); fatalError("accepted malformed record") } catch {}
         print("Process identity, reused-PID protection, wait and stop checks passed")
@@ -39,7 +55,8 @@ struct ProcessIdentitySmoke {
     static func launch(_ verb: String, _ directory: URL) throws -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: CommandLine.arguments[1])
-        process.arguments = [verb, "--vm", directory.path, "--grace-seconds", "1"]
+        process.arguments = [verb, "--vm", directory.path]
+        if verb == "stop" { process.arguments?.append(contentsOf: ["--grace-seconds", "1"]) }
         process.standardOutput = FileHandle.nullDevice
         try process.run()
         return process

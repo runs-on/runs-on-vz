@@ -27,13 +27,17 @@ struct ProcessIdentity: Codable, Equatable {
     }
 
     func write(_ path: URL) throws {
-        try JSONEncoder().encode(self).write(to: path, options: .atomic)
-        let file = try FileHandle(forWritingTo: path)
-        defer { try? file.close() }
-        try file.synchronize()
-        let directory = open(path.deletingLastPathComponent().path, O_RDONLY)
-        guard directory >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-        defer { close(directory) }
-        guard fsync(directory) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        try writeDurably(JSONEncoder().encode(self), to: path)
     }
+}
+
+func writeDurably(_ data: Data, to path: URL) throws {
+    try data.write(to: path, options: .atomic)
+    let file = try FileHandle(forWritingTo: path)
+    defer { try? file.close() }
+    try file.synchronize()
+    let directory = open(path.deletingLastPathComponent().path, O_RDONLY)
+    guard directory >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+    defer { close(directory) }
+    guard fsync(directory) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
 }
