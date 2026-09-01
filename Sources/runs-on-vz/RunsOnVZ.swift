@@ -22,20 +22,27 @@ private struct Arguments {
     private var values: [String: String] = [:]
     private var flags: Set<String> = []
 
-    init(_ raw: ArraySlice<String>) throws {
+    init(_ raw: ArraySlice<String>, valueNames: Set<String>, flagNames: Set<String>) throws {
         var iterator = raw.makeIterator()
         while let argument = iterator.next() {
             guard argument.hasPrefix("--") else {
                 throw CLIError(code: .usage, kind: "invalid_argument", message: "unexpected argument \(argument)")
             }
-            switch argument {
-            case "--json", "--detach":
+            if flagNames.contains(argument) {
+                guard !flags.contains(argument) else {
+                    throw CLIError(code: .usage, kind: "duplicate_argument", message: "\(argument) was provided more than once")
+                }
                 flags.insert(argument)
-            default:
+            } else if valueNames.contains(argument) {
+                guard values[argument] == nil else {
+                    throw CLIError(code: .usage, kind: "duplicate_argument", message: "\(argument) was provided more than once")
+                }
                 guard let value = iterator.next(), !value.hasPrefix("--") else {
                     throw CLIError(code: .usage, kind: "missing_value", message: "\(argument) requires a value")
                 }
                 values[argument] = value
+            } else {
+                throw CLIError(code: .usage, kind: "unknown_option", message: "unknown option \(argument)")
             }
         }
     }
@@ -59,6 +66,7 @@ private struct Arguments {
     }
 
     func has(_ name: String) -> Bool { flags.contains(name) }
+    func optional(_ name: String) -> String? { values[name] }
 }
 
 private enum JSONOutput {
@@ -69,7 +77,7 @@ private enum JSONOutput {
     }
 
     static func failure(_ error: CLIError) {
-        write(["error": ["code": error.kind, "message": error.message]], to: FileHandle.standardError)
+        write(["ok": false, "error": ["kind": error.kind, "message": error.message]], to: FileHandle.standardError)
     }
 
     private static func write(_ payload: [String: Any], to handle: FileHandle) {
@@ -85,6 +93,7 @@ private struct VMDirectory {
     var disk: URL { url.appendingPathComponent("disk.img") }
     var nvram: URL { url.appendingPathComponent("nvram.bin") }
     var pid: URL { url.appendingPathComponent("run.pid") }
+    var result: URL { url.appendingPathComponent("run.result") }
     var log: URL { url.appendingPathComponent("run.log") }
 
     func validate() throws {
@@ -147,17 +156,14 @@ private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
     guard !FileManager.default.fileExists(atPath: destination.url.path) else {
         throw CLIError(code: .configuration, kind: "destination_exists", message: "destination already exists: \(destination.url.path)")
     }
-    do {
-        try FileManager.default.createDirectory(at: destination.url, withIntermediateDirectories: false)
-    } catch {
-        throw CLIError(code: .io, kind: "create_destination", message: "create \(destination.url.path): \(error.localizedDescription)")
-    }
+    let lock = try VMDirectoryLock.create(destination.url)
+    defer { lock.release() }
     do {
         try cloneFile(source.disk, destination.disk)
         try cloneFile(source.nvram, destination.nvram)
         try cloneConfig(source.config, destination.config)
     } catch {
-        try? FileManager.default.removeItem(at: destination.url)
+        try? lock.removeDirectory()
         throw error
     }
 }
@@ -182,9 +188,12 @@ private func cloneConfig(_ source: URL, _ destination: URL) throws {
 @MainActor
 private final class VirtualMachineSession: NSObject {
     let machine: VZVirtualMachine
+    private var bootstrapChannel: BootstrapChannel?
     private var stopped = false
+    private var stopFailure: String?
+    private var stopRequested = false
 
-    init(directory: VMDirectory, cpus: Int, memoryMiB: Int) throws {
+    init(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
         let imageConfig = try VMConfig(url: directory.config)
         guard cpus >= imageConfig.cpuCountMin else {
             throw CLIError(code: .configuration, kind: "insufficient_cpu", message: "VM requires at least \(imageConfig.cpuCountMin) CPUs")
@@ -235,17 +244,36 @@ private final class VirtualMachineSession: NSObject {
         machine = VZVirtualMachine(configuration: configuration)
         super.init()
         machine.delegate = self
+        if let bootstrapFile {
+            let channel = try BootstrapChannel(path: bootstrapFile)
+            guard let socket = machine.socketDevices.first as? VZVirtioSocketDevice else {
+                throw CLIError(code: .configuration, kind: "missing_socket", message: "VM socket device is unavailable")
+            }
+            socket.setSocketListener(channel.listener, forPort: 1024)
+            bootstrapChannel = channel
+        }
     }
 
     func run() async throws {
         try await machine.start(options: VZMacOSVirtualMachineStartOptions())
-        while !stopped && machine.state != .stopped && machine.state != .error {
+        if stopRequested { stopRunningMachine() }
+        FileHandle.standardError.write(Data("runs-on-vz: started\n".utf8))
+        // The delegate owns the terminal outcome. Waiting for its callback
+        // prevents an error-state observation from racing ahead of the error.
+        while !stopped {
             try await Task.sleep(for: .milliseconds(250))
+        }
+        if let stopFailure {
+            throw CLIError(code: .software, kind: "vm_crashed", message: "VM stopped with an error: \(stopFailure)")
         }
     }
 
     func requestStop() {
-        guard machine.state == .running else { return }
+        stopRequested = true
+        if machine.state == .running { stopRunningMachine() }
+    }
+
+    private func stopRunningMachine() {
         do {
             try machine.requestStop()
         } catch {
@@ -260,36 +288,77 @@ extension VirtualMachineSession: VZVirtualMachineDelegate {
     }
 
     nonisolated func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
-        Task { @MainActor in stopped = true }
+        let message = error.localizedDescription
+        Task { @MainActor in
+            stopFailure = message
+            stopped = true
+        }
     }
 }
 
-private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int) throws {
+private func argumentSchema(for command: String) throws -> (values: Set<String>, flags: Set<String>) {
+    let json = Set(["--json"])
+    switch command {
+    case "clone":
+        return (["--source", "--destination"], json)
+    case "run":
+        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], json.union(["--detach"]))
+    case "internal-run":
+        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], [])
+    case "wait", "ip", "delete":
+        return (["--vm"], json)
+    case "stop":
+        return (["--vm", "--grace-seconds"], json)
+    default:
+        throw CLIError(code: .usage, kind: "unknown_command", message: "unknown command \(command)")
+    }
+}
+
+private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
+    let lock = try VMDirectoryLock(directory.url)
+    defer { lock.release() }
     try directory.validate()
-    if let pid = readPID(directory.pid), processExists(pid) {
-        throw CLIError(code: .unavailable, kind: "already_running", message: "VM is already running with pid \(pid)")
+    if let identity = try ProcessIdentity.read(directory.pid), try identity.isRunning() {
+        throw CLIError(code: .unavailable, kind: "already_running", message: "VM is already running")
     }
     try? FileManager.default.removeItem(at: directory.pid)
+    try? FileManager.default.removeItem(at: directory.result)
     FileManager.default.createFile(atPath: directory.log.path, contents: nil)
     let log = try FileHandle(forWritingTo: directory.log)
-    try log.seekToEnd()
+    try log.truncate(atOffset: 0)
 
     let process = Process()
     process.executableURL = executableURL()
     process.arguments = ["internal-run", "--vm", directory.url.path, "--cpus", String(cpus), "--memory-mib", String(memoryMiB)]
+    if let bootstrapFile {
+        process.arguments?.append(contentsOf: ["--bootstrap-file", bootstrapFile])
+    }
     process.standardOutput = log
     process.standardError = log
+    let gate = Pipe()
+    process.standardInput = gate
+    defer { try? gate.fileHandleForWriting.close() }
     do {
         try process.run()
     } catch {
         try? log.close()
         throw CLIError(code: .software, kind: "start_process", message: "start VM process: \(error.localizedDescription)")
     }
-    try Data("\(process.processIdentifier)\n".utf8).write(to: directory.pid, options: .atomic)
+    guard let identity = try ProcessIdentity.current(process.processIdentifier) else {
+        throw CLIError(code: .software, kind: "process_identity", message: "VM child exited before startup")
+    }
+    try identity.write(directory.pid)
+    // EOF without this gate means the launcher died before recording the
+    // child. Such a child must exit without touching Virtualization.framework.
+    try gate.fileHandleForWriting.write(contentsOf: Data("start\n".utf8))
+    try gate.fileHandleForWriting.close()
     try? log.close()
 
     for _ in 0..<100 {
-        if !processExists(process.processIdentifier) {
+        if try !identity.isRunning() {
+            if let recorded = try? ProcessIdentity.read(directory.pid), recorded == identity {
+                try? FileManager.default.removeItem(at: directory.pid)
+            }
             throw CLIError(code: .software, kind: "vm_start_failed", message: "VM process exited; see \(directory.log.path)")
         }
         if let contents = try? String(contentsOf: directory.log, encoding: .utf8), contents.contains("runs-on-vz: started") {
@@ -297,11 +366,22 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int) th
         }
         usleep(50_000)
     }
+    do {
+        try stopVM(directory: directory, graceSeconds: 1)
+    } catch {
+        throw CLIError(code: .software, kind: "start_timeout_cleanup", message: "VM did not report startup and could not be stopped: \(error.localizedDescription)")
+    }
+    throw CLIError(code: .software, kind: "start_timeout", message: "VM did not report startup; see \(directory.log.path)")
 }
 
 @MainActor
-private func runForeground(directory: VMDirectory, cpus: Int, memoryMiB: Int) async throws {
-    let session = try VirtualMachineSession(directory: directory, cpus: cpus, memoryMiB: memoryMiB)
+private func runRecordedForeground(directory: VMDirectory, identity: ProcessIdentity, cpus: Int, memoryMiB: Int, bootstrapFile: String?) async throws {
+    guard try ProcessIdentity.read(directory.pid) == identity else {
+        throw CLIError(code: .software, kind: "process_identity", message: "VM process no longer owns its startup record")
+    }
+    // The launcher records the child before opening its gate. Never recreate
+    // a missing or replaced record after another owner has started cleanup.
+    let session = try VirtualMachineSession(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -313,17 +393,23 @@ private func runForeground(directory: VMDirectory, cpus: Int, memoryMiB: Int) as
     defer {
         term.cancel()
         interrupt.cancel()
-        if readPID(directory.pid) == getpid() { try? FileManager.default.removeItem(at: directory.pid) }
     }
-    FileHandle.standardError.write(Data("runs-on-vz: started\n".utf8))
-    try await session.run()
+    do {
+        try await session.run()
+        try RunResult(identity: identity, failure: nil).write(directory.result)
+    } catch {
+        let failure = wrap(error)
+        try? RunResult(identity: identity, failure: RunFailure(kind: failure.kind, message: failure.message)).write(directory.result)
+        throw error
+    }
 }
 
 private func stopVM(directory: VMDirectory, graceSeconds: Int) throws {
-    guard let pid = readPID(directory.pid) else {
+    guard let identity = try ProcessIdentity.read(directory.pid) else {
         return
     }
-    guard processExists(pid) else {
+    let pid = identity.pid
+    guard try identity.isRunning() else {
         try? FileManager.default.removeItem(at: directory.pid)
         return
     }
@@ -332,16 +418,69 @@ private func stopVM(directory: VMDirectory, graceSeconds: Int) throws {
     }
     let deadline = Date().addingTimeInterval(TimeInterval(graceSeconds))
     while Date() < deadline {
-        if !processExists(pid) {
+        if try !identity.isRunning() {
             try? FileManager.default.removeItem(at: directory.pid)
             return
         }
         usleep(100_000)
     }
-    if kill(pid, SIGKILL) != 0 && errno != ESRCH {
+    if try identity.isRunning(), kill(pid, SIGKILL) != 0 && errno != ESRCH {
         throw CLIError(code: .software, kind: "force_stop", message: "force-stop VM process \(pid): \(String(cString: strerror(errno)))")
     }
+    let killDeadline = Date().addingTimeInterval(5)
+    while try identity.isRunning() && Date() < killDeadline { usleep(100_000) }
+    guard try !identity.isRunning() else {
+        throw CLIError(code: .software, kind: "stop_timeout", message: "VM process did not exit after force-stop")
+    }
     try? FileManager.default.removeItem(at: directory.pid)
+}
+
+private func recordForegroundProcess(directory: VMDirectory) throws -> ProcessIdentity {
+    let lock = try VMDirectoryLock(directory.url)
+    defer { lock.release() }
+    if let previous = try ProcessIdentity.read(directory.pid), try previous.isRunning() {
+        throw CLIError(code: .unavailable, kind: "already_running", message: "VM is already running")
+    }
+    guard let identity = try ProcessIdentity.current(getpid()) else {
+        throw CLIError(code: .software, kind: "process_identity", message: "cannot identify VM process")
+    }
+    try? FileManager.default.removeItem(at: directory.result)
+    try identity.write(directory.pid)
+    return identity
+}
+
+private func cleanupVM(directory: VMDirectory, graceSeconds: Int, delete: Bool) throws {
+    let lock: VMDirectoryLock
+    do {
+        lock = try VMDirectoryLock(directory.url)
+    } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+        return // Cleanup is idempotent when the VM directory is already gone.
+    }
+    defer { lock.release() }
+    try stopVM(directory: directory, graceSeconds: graceSeconds)
+    if delete { try lock.removeDirectory() }
+}
+
+private func waitVM(directory: VMDirectory) throws {
+    guard let identity = try ProcessIdentity.read(directory.pid) else {
+        throw CLIError(code: .software, kind: "process_identity", message: "VM process identity is missing")
+    }
+    while try identity.isRunning() { usleep(100_000) }
+    let result: RunResult?
+    do {
+        result = try RunResult.read(directory.result)
+    } catch {
+        throw CLIError(code: .software, kind: "invalid_result", message: "read VM result: \(error.localizedDescription)")
+    }
+    guard let result else {
+        throw CLIError(code: .software, kind: "unexpected_exit", message: "VM process exited without recording a result")
+    }
+    guard result.identity == identity else {
+        throw CLIError(code: .software, kind: "stale_result", message: "VM result does not match the observed process")
+    }
+    if let failure = result.failure {
+        throw CLIError(code: .software, kind: failure.kind, message: failure.message)
+    }
 }
 
 private func findIPAddress(directory: VMDirectory, timeoutSeconds: Int = 120) throws -> String {
@@ -386,15 +525,6 @@ func normalizedMACAddress(_ address: String) -> String? {
     return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
 }
 
-private func readPID(_ url: URL) -> pid_t? {
-    guard let text = try? String(contentsOf: url, encoding: .utf8), let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), value > 1 else { return nil }
-    return value
-}
-
-private func processExists(_ pid: pid_t) -> Bool {
-    kill(pid, 0) == 0 || errno == EPERM
-}
-
 private func executableURL() -> URL {
     if let url = Bundle.main.executableURL { return url }
     let argument = CommandLine.arguments[0]
@@ -412,10 +542,11 @@ private enum RunsOnVZ {
     static func main() async {
         do {
             guard CommandLine.arguments.count >= 2 else {
-                throw CLIError(code: .usage, kind: "missing_command", message: "usage: runs-on-vz <clone|run|ip|stop|delete> [options]")
+                throw CLIError(code: .usage, kind: "missing_command", message: "usage: runs-on-vz <clone|run|wait|ip|stop|delete> [options]")
             }
             let command = CommandLine.arguments[1]
-            let arguments = try Arguments(CommandLine.arguments.dropFirst(2))
+            let schema = try argumentSchema(for: command)
+            let arguments = try Arguments(CommandLine.arguments.dropFirst(2), valueNames: schema.values, flagNames: schema.flags)
             switch command {
             case "clone":
                 let source = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--source")))
@@ -426,27 +557,37 @@ private enum RunsOnVZ {
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
                 let cpus = try arguments.integer("--cpus")
                 let memoryMiB = try arguments.integer("--memory-mib")
+                let bootstrapFile = arguments.optional("--bootstrap-file")
                 if arguments.has("--detach") {
-                    try startDetached(directory: directory, cpus: cpus, memoryMiB: memoryMiB)
+                    try startDetached(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
                     JSONOutput.success()
                 } else {
-                    try await runForeground(directory: directory, cpus: cpus, memoryMiB: memoryMiB)
+                    let identity = try recordForegroundProcess(directory: directory)
+                    try await runRecordedForeground(directory: directory, identity: identity, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
                     JSONOutput.success()
                 }
             case "internal-run":
+                guard readLine() == "start" else {
+                    throw CLIError(code: .software, kind: "start_cancelled", message: "VM launcher did not authorize startup")
+                }
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
-                try await runForeground(directory: directory, cpus: try arguments.integer("--cpus"), memoryMiB: try arguments.integer("--memory-mib"))
+                guard let identity = try ProcessIdentity.current(getpid()) else {
+                    throw CLIError(code: .software, kind: "process_identity", message: "cannot identify VM process")
+                }
+                try await runRecordedForeground(directory: directory, identity: identity, cpus: try arguments.integer("--cpus"), memoryMiB: try arguments.integer("--memory-mib"), bootstrapFile: arguments.optional("--bootstrap-file"))
+            case "wait":
+                try waitVM(directory: VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm"))))
+                JSONOutput.success()
             case "ip":
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
                 JSONOutput.success(["ip": try findIPAddress(directory: directory)])
             case "stop":
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
-                try stopVM(directory: directory, graceSeconds: try arguments.integer("--grace-seconds", default: 30))
+                try cleanupVM(directory: directory, graceSeconds: try arguments.integer("--grace-seconds", default: 30), delete: false)
                 JSONOutput.success()
             case "delete":
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
-                try stopVM(directory: directory, graceSeconds: 5)
-                if FileManager.default.fileExists(atPath: directory.url.path) { try FileManager.default.removeItem(at: directory.url) }
+                try cleanupVM(directory: directory, graceSeconds: 5, delete: true)
                 JSONOutput.success()
             default:
                 throw CLIError(code: .usage, kind: "unknown_command", message: "unknown command \(command)")
