@@ -22,20 +22,27 @@ private struct Arguments {
     private var values: [String: String] = [:]
     private var flags: Set<String> = []
 
-    init(_ raw: ArraySlice<String>) throws {
+    init(_ raw: ArraySlice<String>, valueNames: Set<String>, flagNames: Set<String>) throws {
         var iterator = raw.makeIterator()
         while let argument = iterator.next() {
             guard argument.hasPrefix("--") else {
                 throw CLIError(code: .usage, kind: "invalid_argument", message: "unexpected argument \(argument)")
             }
-            switch argument {
-            case "--json", "--detach":
+            if flagNames.contains(argument) {
+                guard !flags.contains(argument) else {
+                    throw CLIError(code: .usage, kind: "duplicate_argument", message: "\(argument) was provided more than once")
+                }
                 flags.insert(argument)
-            default:
+            } else if valueNames.contains(argument) {
+                guard values[argument] == nil else {
+                    throw CLIError(code: .usage, kind: "duplicate_argument", message: "\(argument) was provided more than once")
+                }
                 guard let value = iterator.next(), !value.hasPrefix("--") else {
                     throw CLIError(code: .usage, kind: "missing_value", message: "\(argument) requires a value")
                 }
                 values[argument] = value
+            } else {
+                throw CLIError(code: .usage, kind: "unknown_option", message: "unknown option \(argument)")
             }
         }
     }
@@ -70,7 +77,7 @@ private enum JSONOutput {
     }
 
     static func failure(_ error: CLIError) {
-        write(["error": ["code": error.kind, "message": error.message]], to: FileHandle.standardError)
+        write(["ok": false, "error": ["kind": error.kind, "message": error.message]], to: FileHandle.standardError)
     }
 
     private static func write(_ payload: [String: Any], to handle: FileHandle) {
@@ -182,6 +189,8 @@ private final class VirtualMachineSession: NSObject {
     let machine: VZVirtualMachine
     private var bootstrapChannel: BootstrapChannel?
     private var stopped = false
+    private var stopFailure: String?
+    private var stopRequested = false
 
     init(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
         let imageConfig = try VMConfig(url: directory.config)
@@ -246,14 +255,25 @@ private final class VirtualMachineSession: NSObject {
 
     func run() async throws {
         try await machine.start(options: VZMacOSVirtualMachineStartOptions())
+        if stopRequested { stopRunningMachine() }
         FileHandle.standardError.write(Data("runs-on-vz: started\n".utf8))
         while !stopped && machine.state != .stopped && machine.state != .error {
             try await Task.sleep(for: .milliseconds(250))
         }
+        if let stopFailure {
+            throw CLIError(code: .software, kind: "vm_crashed", message: "VM stopped with an error: \(stopFailure)")
+        }
+        if machine.state == .error {
+            throw CLIError(code: .software, kind: "vm_crashed", message: "VM entered the error state")
+        }
     }
 
     func requestStop() {
-        guard machine.state == .running else { return }
+        stopRequested = true
+        if machine.state == .running { stopRunningMachine() }
+    }
+
+    private func stopRunningMachine() {
         do {
             try machine.requestStop()
         } catch {
@@ -268,7 +288,29 @@ extension VirtualMachineSession: VZVirtualMachineDelegate {
     }
 
     nonisolated func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
-        Task { @MainActor in stopped = true }
+        let message = error.localizedDescription
+        Task { @MainActor in
+            stopFailure = message
+            stopped = true
+        }
+    }
+}
+
+private func argumentSchema(for command: String) throws -> (values: Set<String>, flags: Set<String>) {
+    let json = Set(["--json"])
+    switch command {
+    case "clone":
+        return (["--source", "--destination"], json)
+    case "run":
+        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], json.union(["--detach"]))
+    case "internal-run":
+        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], [])
+    case "wait", "ip", "delete":
+        return (["--vm"], json)
+    case "stop":
+        return (["--vm", "--grace-seconds"], json)
+    default:
+        throw CLIError(code: .usage, kind: "unknown_command", message: "unknown command \(command)")
     }
 }
 
@@ -475,7 +517,8 @@ private enum RunsOnVZ {
                 throw CLIError(code: .usage, kind: "missing_command", message: "usage: runs-on-vz <clone|run|wait|ip|stop|delete> [options]")
             }
             let command = CommandLine.arguments[1]
-            let arguments = try Arguments(CommandLine.arguments.dropFirst(2))
+            let schema = try argumentSchema(for: command)
+            let arguments = try Arguments(CommandLine.arguments.dropFirst(2), valueNames: schema.values, flagNames: schema.flags)
             switch command {
             case "clone":
                 let source = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--source")))

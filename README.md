@@ -7,7 +7,7 @@ on customer infrastructure.
 The CLI is intentionally narrow and machine-oriented:
 
 ```text
-runs-on-vz clone --source IMAGE --destination VM --slot 0 --json
+runs-on-vz clone --source IMAGE --destination VM --json
 runs-on-vz run --vm VM --cpus 6 --memory-mib 15360 --detach --json
 runs-on-vz run --vm VM --cpus 4 --memory-mib 8192 --bootstrap-file EXECUTION_DIR/channel.json --detach --json
 runs-on-vz ip --vm VM --json
@@ -15,6 +15,10 @@ runs-on-vz wait --vm VM --json
 runs-on-vz stop --vm VM --grace-seconds 30 --json
 runs-on-vz delete --vm VM --json
 ```
+
+Commands reject unknown, duplicate, and command-inapplicable options. Failures
+exit nonzero and write `{"ok":false,"error":{"kind":"…","message":"…"}}`.
+Callers must treat malformed output or a false `ok` value as a contract error.
 
 Each clone uses APFS `clonefile(2)` and receives a distinct MAC address and Mac
 machine identifier. VMs are headless, use NAT networking, and expose their IP

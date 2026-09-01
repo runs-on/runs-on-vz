@@ -16,6 +16,14 @@ struct LifecycleSmoke {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vz-lifecycle-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
+        try assertFailure(
+            binary,
+            ["clone", "--source", root.path, "--destination", root.appendingPathComponent("unused").path, "--slot", "0", "--json"],
+            status: 64,
+            kind: "unknown_option"
+        )
+        try assertFailure(binary, ["wait", "--vm", root.path, "--detach", "--json"], status: 64, kind: "unknown_option")
+        try assertFailure(binary, ["wait", "--vm", root.path, "--vm", root.path, "--json"], status: 64, kind: "duplicate_argument")
         for command in ["stop", "delete", "run", "foreground"] {
             let vm = root.appendingPathComponent(command)
             try fixture(vm)
@@ -130,7 +138,7 @@ struct LifecycleSmoke {
                 throw SmokeFailure("clone writes changed the source disk")
             }
         }
-        print("Lifecycle serialization, replacement protection, launcher EOF and concurrent fresh-clone checks passed")
+        print("Strict arguments, typed failures, lifecycle serialization, launcher EOF and concurrent fresh-clone checks passed")
     }
 
     static func fixture(_ directory: URL) throws {
@@ -150,6 +158,27 @@ struct LifecycleSmoke {
         process.standardError = FileHandle.nullDevice
         try process.run()
         return process
+    }
+
+    static func assertFailure(_ binary: URL, _ arguments: [String], status: Int32, kind: String) throws {
+        let errors = Pipe()
+        let process = Process()
+        process.executableURL = binary
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let data = errors.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == status,
+              let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              payload["ok"] as? Bool == false,
+              let error = payload["error"] as? [String: Any],
+              error["kind"] as? String == kind,
+              error["message"] as? String != nil else {
+            throw SmokeFailure("expected status \(status) and typed \(kind) failure for \(arguments)")
+        }
     }
 
     static func finish(_ process: Process) {
