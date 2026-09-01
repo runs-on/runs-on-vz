@@ -258,14 +258,13 @@ private final class VirtualMachineSession: NSObject {
         try await machine.start(options: VZMacOSVirtualMachineStartOptions())
         if stopRequested { stopRunningMachine() }
         FileHandle.standardError.write(Data("runs-on-vz: started\n".utf8))
-        while !stopped && machine.state != .stopped && machine.state != .error {
+        // The delegate owns the terminal outcome. Waiting for its callback
+        // prevents an error-state observation from racing ahead of the error.
+        while !stopped {
             try await Task.sleep(for: .milliseconds(250))
         }
         if let stopFailure {
             throw CLIError(code: .software, kind: "vm_crashed", message: "VM stopped with an error: \(stopFailure)")
-        }
-        if machine.state == .error {
-            throw CLIError(code: .software, kind: "vm_crashed", message: "VM entered the error state")
         }
     }
 
