@@ -16,9 +16,21 @@ runs-on-vz stop --vm VM --grace-seconds 30 --json
 runs-on-vz delete --vm VM --json
 ```
 
-Commands reject unknown, duplicate, and command-inapplicable options. Failures
-exit nonzero and write `{"ok":false,"error":{"kind":"…","message":"…"}}`.
-Callers must treat malformed output or a false `ok` value as a contract error.
+Commands reject unknown, duplicate, and command-inapplicable options. Output is
+always JSON; `--json` is accepted but optional.
+
+- Success exits 0 and writes one JSON object with `"ok":true` to stdout.
+  `ip` adds an `ip` field. Only a foreground `run` (without `--detach`) also
+  writes progress lines to stderr; a detached VM logs to `VM/run.log`.
+- Failure exits nonzero and writes
+  `{"ok":false,"error":{"kind":"…","message":"…"}}` to stderr. Nothing is
+  written to stdout.
+
+Callers should decode the success envelope from stdout only and the failure
+envelope from stderr only, so a wrapper's diagnostics (such as `launchctl` or
+`sudo` output) cannot corrupt either. Treat malformed output, a missing `ok`,
+or `ok:false` without an error kind and message as a contract error. Key
+decisions on `error.kind`, not on the exit status value.
 
 Each clone uses APFS `clonefile(2)` and receives a distinct MAC address and Mac
 machine identifier. VMs are headless, use NAT networking, and expose their IP
@@ -67,6 +79,26 @@ No SSH job dispatch or additional privacy grants were used.
 Virtualization.framework operations must run inside an unlocked Aqua session.
 RunsOn launches the CLI as a dedicated non-admin console user; calling `run`
 from a system LaunchDaemon without a GUI session fails on stock macOS images.
+
+## Upgrading from v0.1
+
+v0.2.0 is a breaking release. Callers written for v0.1.x must change:
+
+- `clone` no longer accepts `--slot`. v0.1.x ignored it; v0.2.0 rejects it,
+  like any unknown option, with exit status 64 and kind `unknown_option`.
+- Every command now rejects unknown, duplicate and inapplicable options
+  instead of ignoring them.
+- Failures now write `{"ok":false,"error":{"kind":"…","message":"…"}}`.
+  v0.1.x wrote `{"error":{"code":"…","message":"…"}}` without `ok`.
+- `wait` and `run --bootstrap-file` are new. Hosts that start execution-bound
+  guests need both, so they cannot run on v0.1.x.
+
+The RunsOn host agent requires v0.2.0 or newer. Its adapter never sends
+`--slot`, starts VMs with `run --detach` (adding `--bootstrap-file` for
+execution-bound guests), and holds `wait` open for each VM's lifetime. It
+decodes `{"ok":true}` from stdout on exit 0 and the `ok:false` envelope from
+stderr on a nonzero exit, and treats anything else as a contract error. It
+does not call `ip`.
 
 ## Build
 
