@@ -44,12 +44,20 @@ A detached child cannot start its VM until its parent durably records its
 identity. Malformed process records fail closed; inspect them before cleanup.
 
 Clone, start, stop and delete serialize through a kernel lock on the VM directory.
-A waiter verifies the directory inode after acquiring that lock; a replacement
-at the same path is not the same VM. Clone directory creation is exclusive, so
-a losing clone cannot remove another clone's files. A short parent-directory
-lock protects creation through opening the new inode, and directory removal.
-It is not held during VM startup or shutdown. The host agent sets the
-clone's owner explicitly before starting the dedicated console user's runtime.
+A command blocked on that lock re-verifies the directory inode once it acquires
+the lock; a replacement at the same path is not the same VM, and the command
+fails instead. `wait` takes no lock, because it lasts as long as the VM and
+must not block `stop`. It binds to the process identity recorded when it
+starts and accepts only a result written by that process. If the directory is
+replaced or deleted meanwhile, `wait` reports that process's own result or
+fails with `stale_result` or `unexpected_exit`; it never reports another VM's
+outcome.
+
+Clone directory creation is exclusive, so a losing clone cannot remove another
+clone's files. A short parent-directory lock protects creation through opening
+the new inode, and directory removal. It is not held during VM startup or
+shutdown. The host agent sets the clone's owner explicitly before starting the
+dedicated console user's runtime.
 
 The socket replaces virtiofs bootstrap, which macOS privacy protection blocks
 when accessed by a daemon at cold boot. Two simultaneous Sequoia 15.6.1 guests
