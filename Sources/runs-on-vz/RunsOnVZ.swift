@@ -95,6 +95,9 @@ private struct VMDirectory {
     var pid: URL { url.appendingPathComponent("run.pid") }
     var result: URL { url.appendingPathComponent("run.result") }
     var log: URL { url.appendingPathComponent("run.log") }
+    // A running VM's saved memory and devices (run --save-state): the disk
+    // and NVRAM next to it are as they were when it was saved.
+    var state: URL { url.appendingPathComponent("state.vzvmsave") }
 
     func validate() throws {
         for file in [config, disk, nvram] where !FileManager.default.fileExists(atPath: file.path) {
@@ -151,7 +154,7 @@ private struct VMConfig {
     }
 }
 
-private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
+private func cloneVM(source: VMDirectory, destination: VMDirectory, keepMAC: Bool, keepECID: Bool) throws {
     try source.validate()
     guard !FileManager.default.fileExists(atPath: destination.url.path) else {
         throw CLIError(code: .configuration, kind: "destination_exists", message: "destination already exists: \(destination.url.path)")
@@ -161,7 +164,10 @@ private func cloneVM(source: VMDirectory, destination: VMDirectory) throws {
     do {
         try cloneFile(source.disk, destination.disk)
         try cloneFile(source.nvram, destination.nvram)
-        try cloneConfig(source.config, destination.config)
+        try cloneConfig(source.config, destination.config, keepMAC: keepMAC, keepECID: keepECID)
+        if FileManager.default.fileExists(atPath: source.state.path) {
+            try cloneFile(source.state, destination.state)
+        }
     } catch {
         try? lock.removeDirectory()
         throw error
@@ -174,13 +180,13 @@ private func cloneFile(_ source: URL, _ destination: URL) throws {
     }
 }
 
-private func cloneConfig(_ source: URL, _ destination: URL) throws {
+private func cloneConfig(_ source: URL, _ destination: URL, keepMAC: Bool, keepECID: Bool) throws {
     let data = try Data(contentsOf: source)
     guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         throw CLIError(code: .configuration, kind: "invalid_config", message: "config.json is not a JSON object")
     }
-    json["macAddress"] = VZMACAddress.randomLocallyAdministered().string
-    json["ecid"] = VZMacMachineIdentifier().dataRepresentation.base64EncodedString()
+    if !keepMAC { json["macAddress"] = VZMACAddress.randomLocallyAdministered().string }
+    if !keepECID { json["ecid"] = VZMacMachineIdentifier().dataRepresentation.base64EncodedString() }
     let encoded = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     try encoded.write(to: destination, options: .atomic)
 }
@@ -192,8 +198,15 @@ private final class VirtualMachineSession: NSObject {
     private var stopped = false
     private var stopFailure: String?
     private var stopRequested = false
+    private let saveState: Bool
+    private let restore: URL?
+    private let directory: VMDirectory
+    private var snapshotSignal: SnapshotSignal?
 
-    init(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
+    init(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?, saveState: Bool = false, restoreState: Bool = false) throws {
+        self.saveState = saveState
+        self.directory = directory
+        restore = restoreState ? directory.state : nil
         let imageConfig = try VMConfig(url: directory.config)
         guard cpus >= imageConfig.cpuCountMin else {
             throw CLIError(code: .configuration, kind: "insufficient_cpu", message: "VM requires at least \(imageConfig.cpuCountMin) CPUs")
@@ -221,9 +234,14 @@ private final class VirtualMachineSession: NSObject {
         configuration.keyboards = [VZMacKeyboardConfiguration()]
         configuration.pointingDevices = [VZMacTrackpadConfiguration()]
 
-        let sound = VZVirtioSoundDeviceConfiguration()
-        sound.streams = [VZVirtioSoundDeviceOutputStreamConfiguration()]
-        configuration.audioDevices = [sound]
+        // A VM that is saved or restored has no sound or entropy device, as
+        // Tart's --suspendable: the framework cannot save them.
+        let suspendable = saveState || restoreState
+        if !suspendable {
+            let sound = VZVirtioSoundDeviceConfiguration()
+            sound.streams = [VZVirtioSoundDeviceOutputStreamConfiguration()]
+            configuration.audioDevices = [sound]
+        }
 
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
@@ -232,7 +250,7 @@ private final class VirtualMachineSession: NSObject {
 
         let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: directory.disk, readOnly: false, cachingMode: .automatic, synchronizationMode: .full)
         configuration.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
-        configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        if !suspendable { configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()] }
         let consolePort = VZVirtioConsolePortConfiguration()
         consolePort.name = "runs-on-vz"
         let console = VZVirtioConsoleDeviceConfiguration()
@@ -240,6 +258,7 @@ private final class VirtualMachineSession: NSObject {
         configuration.consoleDevices = [console]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         try configuration.validate()
+        if saveState || restoreState { try configuration.validateSaveRestoreSupport() }
 
         machine = VZVirtualMachine(configuration: configuration)
         super.init()
@@ -251,13 +270,33 @@ private final class VirtualMachineSession: NSObject {
             }
             socket.setSocketListener(channel.listener, forPort: 1024)
             bootstrapChannel = channel
+        } else if saveState {
+            // The guest's first try to read its document says it is waiting
+            // for one: the moment to save it. Refused, it tries again later.
+            let signal = SnapshotSignal()
+            guard let socket = machine.socketDevices.first as? VZVirtioSocketDevice else {
+                throw CLIError(code: .configuration, kind: "missing_socket", message: "VM socket device is unavailable")
+            }
+            socket.setSocketListener(signal.listener, forPort: 1024)
+            snapshotSignal = signal
         }
     }
 
     func run() async throws {
-        try await machine.start(options: VZMacOSVirtualMachineStartOptions())
+        if let restore {
+            let began = Date()
+            try await machine.restoreMachineStateFrom(url: restore)
+            try await machine.resume()
+            FileHandle.standardError.write(Data("runs-on-vz: restored in \(Int(Date().timeIntervalSince(began) * 1000)) ms\n".utf8))
+        } else {
+            try await machine.start(options: VZMacOSVirtualMachineStartOptions())
+        }
         if stopRequested { stopRunningMachine() }
         FileHandle.standardError.write(Data("runs-on-vz: started\n".utf8))
+        if let snapshotSignal {
+            try await save(waitingFor: snapshotSignal)
+            return
+        }
         // The delegate owns the terminal outcome. Waiting for its callback
         // prevents an error-state observation from racing ahead of the error.
         while !stopped {
@@ -266,6 +305,29 @@ private final class VirtualMachineSession: NSObject {
         if let stopFailure {
             throw CLIError(code: .software, kind: "vm_crashed", message: "VM stopped with an error: \(stopFailure)")
         }
+    }
+
+    // save waits for the guest to ask for its document, then saves the VM to
+    // state.vzvmsave and powers it off: its disk stays as it was saved.
+    private func save(waitingFor signal: SnapshotSignal) async throws {
+        let deadline = Date().addingTimeInterval(600)
+        while !signal.asked {
+            if stopped || stopRequested {
+                throw CLIError(code: .software, kind: "save_stopped", message: "VM stopped before its guest was ready")
+            }
+            if Date() > deadline {
+                throw CLIError(code: .software, kind: "save_timeout", message: "guest did not ask for its document in 10 minutes")
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        // Let the guest settle in its wait between two tries.
+        try await Task.sleep(for: .seconds(3))
+        try await machine.pause()
+        let began = Date()
+        try? FileManager.default.removeItem(at: directory.state)
+        try await machine.saveMachineStateTo(url: directory.state)
+        FileHandle.standardError.write(Data("runs-on-vz: saved in \(Int(Date().timeIntervalSince(began) * 1000)) ms\n".utf8))
+        try await machine.stop()
     }
 
     func requestStop() {
@@ -298,13 +360,14 @@ extension VirtualMachineSession: VZVirtualMachineDelegate {
 
 private func argumentSchema(for command: String) throws -> (values: Set<String>, flags: Set<String>) {
     let json = Set(["--json"])
+
     switch command {
     case "clone":
-        return (["--source", "--destination"], json)
+        return (["--source", "--destination"], json.union(["--keep-mac", "--keep-ecid"]))
     case "run":
-        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], json.union(["--detach"]))
+        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], json.union(["--detach", "--save-state", "--restore-state"]))
     case "internal-run":
-        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], [])
+        return (["--vm", "--cpus", "--memory-mib", "--bootstrap-file"], ["--restore-state"])
     case "wait", "ip", "delete":
         return (["--vm"], json)
     case "stop":
@@ -314,7 +377,7 @@ private func argumentSchema(for command: String) throws -> (values: Set<String>,
     }
 }
 
-private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?) throws {
+private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bootstrapFile: String?, restoreState: Bool) throws {
     let lock = try VMDirectoryLock(directory.url)
     defer { lock.release() }
     try directory.validate()
@@ -333,6 +396,7 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
     if let bootstrapFile {
         process.arguments?.append(contentsOf: ["--bootstrap-file", bootstrapFile])
     }
+    if restoreState { process.arguments?.append("--restore-state") }
     process.standardOutput = log
     process.standardError = log
     let gate = Pipe()
@@ -354,7 +418,8 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
     try gate.fileHandleForWriting.close()
     try? log.close()
 
-    for _ in 0..<100 {
+    // A restore reads the VM's memory from disk first.
+    for _ in 0..<1200 {
         if try !identity.isRunning() {
             if let recorded = try? ProcessIdentity.read(directory.pid), recorded == identity {
                 try? FileManager.default.removeItem(at: directory.pid)
@@ -375,13 +440,13 @@ private func startDetached(directory: VMDirectory, cpus: Int, memoryMiB: Int, bo
 }
 
 @MainActor
-private func runRecordedForeground(directory: VMDirectory, identity: ProcessIdentity, cpus: Int, memoryMiB: Int, bootstrapFile: String?) async throws {
+private func runRecordedForeground(directory: VMDirectory, identity: ProcessIdentity, cpus: Int, memoryMiB: Int, bootstrapFile: String?, saveState: Bool = false, restoreState: Bool = false) async throws {
     guard try ProcessIdentity.read(directory.pid) == identity else {
         throw CLIError(code: .software, kind: "process_identity", message: "VM process no longer owns its startup record")
     }
     // The launcher records the child before opening its gate. Never recreate
     // a missing or replaced record after another owner has started cleanup.
-    let session = try VirtualMachineSession(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
+    let session = try VirtualMachineSession(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile, saveState: saveState, restoreState: restoreState)
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -537,6 +602,8 @@ private func wrap(_ error: any Error) -> CLIError {
     return CLIError(code: .software, kind: "internal", message: error.localizedDescription)
 }
 
+nonisolated(unsafe) private var vmActivity: NSObjectProtocol?
+
 @main
 private enum RunsOnVZ {
     static func main() async {
@@ -547,23 +614,34 @@ private enum RunsOnVZ {
             let command = CommandLine.arguments[1]
             let schema = try argumentSchema(for: command)
             let arguments = try Arguments(CommandLine.arguments.dropFirst(2), valueNames: schema.values, flagNames: schema.flags)
+            if command == "run" || command == "internal-run" {
+                // A VM's process is the job's: no App Nap, no disk I/O
+                // throttling (a restore reads gigabytes).
+                vmActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled], reason: "runs-on-vz VM")
+                _ = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_IMPORTANT)
+            }
             switch command {
             case "clone":
                 let source = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--source")))
                 let destination = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--destination")))
-                try cloneVM(source: source, destination: destination)
+                try cloneVM(source: source, destination: destination, keepMAC: arguments.has("--keep-mac"), keepECID: arguments.has("--keep-ecid"))
                 JSONOutput.success()
             case "run":
                 let directory = VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm")))
                 let cpus = try arguments.integer("--cpus")
                 let memoryMiB = try arguments.integer("--memory-mib")
                 let bootstrapFile = arguments.optional("--bootstrap-file")
+                let saveState = arguments.has("--save-state")
+                let restoreState = arguments.has("--restore-state")
+                if saveState && (bootstrapFile != nil || restoreState || arguments.has("--detach")) {
+                    throw CLIError(code: .usage, kind: "invalid_argument", message: "--save-state runs in the foreground, without --bootstrap-file or --restore-state")
+                }
                 if arguments.has("--detach") {
-                    try startDetached(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
+                    try startDetached(directory: directory, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile, restoreState: restoreState)
                     JSONOutput.success()
                 } else {
                     let identity = try recordForegroundProcess(directory: directory)
-                    try await runRecordedForeground(directory: directory, identity: identity, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile)
+                    try await runRecordedForeground(directory: directory, identity: identity, cpus: cpus, memoryMiB: memoryMiB, bootstrapFile: bootstrapFile, saveState: saveState, restoreState: restoreState)
                     JSONOutput.success()
                 }
             case "internal-run":
@@ -574,7 +652,7 @@ private enum RunsOnVZ {
                 guard let identity = try ProcessIdentity.current(getpid()) else {
                     throw CLIError(code: .software, kind: "process_identity", message: "cannot identify VM process")
                 }
-                try await runRecordedForeground(directory: directory, identity: identity, cpus: try arguments.integer("--cpus"), memoryMiB: try arguments.integer("--memory-mib"), bootstrapFile: arguments.optional("--bootstrap-file"))
+                try await runRecordedForeground(directory: directory, identity: identity, cpus: try arguments.integer("--cpus"), memoryMiB: try arguments.integer("--memory-mib"), bootstrapFile: arguments.optional("--bootstrap-file"), restoreState: arguments.has("--restore-state"))
             case "wait":
                 try waitVM(directory: VMDirectory(url: URL(fileURLWithPath: try arguments.require("--vm"))))
                 JSONOutput.success()
@@ -597,5 +675,22 @@ private enum RunsOnVZ {
             JSONOutput.failure(cliError)
             Darwin.exit(cliError.code.rawValue)
         }
+    }
+}
+
+
+@MainActor
+final class SnapshotSignal: NSObject, @preconcurrency VZVirtioSocketListenerDelegate {
+    let listener = VZVirtioSocketListener()
+    private(set) var asked = false
+
+    override init() {
+        super.init()
+        listener.delegate = self
+    }
+
+    func listener(_ listener: VZVirtioSocketListener, shouldAcceptNewConnection connection: VZVirtioSocketConnection, from socketDevice: VZVirtioSocketDevice) -> Bool {
+        asked = true
+        return false
     }
 }

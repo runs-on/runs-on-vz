@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Security
 
 // Read one bounded, regular, host-owned snapshot. A new open observes atomic
 // replacements on the host; no host filesystem is exposed to the guest.
@@ -17,4 +18,15 @@ func bootstrapPayload(_ path: String) throws -> Data {
     let data = try file.read(upToCount: 65537) ?? Data()
     guard !data.isEmpty, data.count <= 65536 else { throw CocoaError(.fileReadCorruptFile) }
     return data
+}
+
+// stamped adds the host's clock and 32 fresh random bytes to an object
+// payload (under "runs-on-vz": time_ms, seed): a guest resumed from a saved
+// state wakes with the clock and random pool it was saved with.
+func stamped(_ data: Data) -> Data {
+    guard var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return data }
+    var seed = [UInt8](repeating: 0, count: 32)
+    guard SecRandomCopyBytes(kSecRandomDefault, seed.count, &seed) == errSecSuccess else { return data }
+    object["runs-on-vz"] = ["time_ms": Int64(Date().timeIntervalSince1970 * 1000), "seed": Data(seed).base64EncodedString()]
+    return (try? JSONSerialization.data(withJSONObject: object)) ?? data
 }

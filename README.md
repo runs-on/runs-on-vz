@@ -7,7 +7,9 @@ on customer infrastructure.
 The CLI is intentionally narrow and machine-oriented:
 
 ```text
-runs-on-vz clone --source IMAGE --destination VM --json
+runs-on-vz clone --source IMAGE --destination VM [--keep-mac --keep-ecid] --json
+runs-on-vz run --vm VM --cpus 4 --memory-mib 8192 --save-state --json
+runs-on-vz run --vm VM --cpus 4 --memory-mib 8192 --restore-state --bootstrap-file FILE --detach --json
 runs-on-vz run --vm VM --cpus 6 --memory-mib 15360 --detach --json
 runs-on-vz run --vm VM --cpus 4 --memory-mib 8192 --bootstrap-file EXECUTION_DIR/channel.json --detach --json
 runs-on-vz ip --vm VM --json
@@ -79,6 +81,47 @@ No SSH job dispatch or additional privacy grants were used.
 Virtualization.framework operations must run inside an unlocked Aqua session.
 RunsOn launches the CLI as a dedicated non-admin console user; calling `run`
 from a system LaunchDaemon without a GUI session fails on stock macOS images.
+
+## Saved states
+
+A VM can be saved once it is running and restored many times, which skips
+macOS's boot (about 35 s) for a restore (4 to 8 s from an SSD):
+
+```text
+runs-on-vz run --vm TEMPLATE --cpus 3 --memory-mib 6144 --save-state --json
+runs-on-vz clone --source TEMPLATE --destination VM --keep-mac --keep-ecid --json
+runs-on-vz run --vm VM --cpus 3 --memory-mib 6144 --restore-state --bootstrap-file FILE --detach --json
+```
+
+- `run --save-state` boots the VM in the foreground, without a bootstrap
+  file, and waits up to 10 minutes for the guest's first connection to port
+  1024: the guest is then waiting for its document. It refuses that
+  connection, lets the guest settle for 3 s, pauses the VM, writes
+  `VM/state.vzvmsave` (its memory and devices: 2.4 GB for a macOS 26 guest
+  of 6 GiB) and powers it off. The disk and NVRAM stay as they were saved.
+- `clone` copies `state.vzvmsave` with the disk (APFS clones). A restore
+  needs the configuration it was saved with: the same MAC address, machine
+  identifier, CPUs and memory (another MAC or identifier fails with "invalid
+  argument"). `--keep-mac --keep-ecid` keep them. Two VMs restored from one
+  state share an address, so a host keeps one saved state per concurrent VM.
+- `run --restore-state` restores `VM/state.vzvmsave` instead of booting and
+  logs `restored in N ms`. The guest resumes where it was saved: it asks for
+  its document again and gets the bootstrap file's.
+- A VM that is saved or restored has no sound or entropy device (the
+  framework cannot save them). Its bootstrap replies add
+  `"runs-on-vz":{"time_ms":…,"seed":"…"}` to the payload's object: the
+  host's clock and 32 random bytes, for a resumed guest to set its clock and
+  stir its random pool, both as they were when it was saved.
+- The framework encrypts a saved state with a Secure Enclave key in the
+  console user's keychain: saving needs that account to hold a secure token
+  (`sysadminctl -secureTokenStatus`), and restoring needs its keychain
+  unlocked, so its screen lock must be off (`sysadminctl -screenLock off`):
+  a locked session refuses restores with "permission denied" about 5
+  minutes after it locks. A state restores only on the Mac and account that
+  saved it.
+- The framework reads a state with small uncached reads: 7.6 s for 2.4 GB
+  from a Mac's internal SSD, 4.1 s from a RAM disk, 33 to 50 s from an EC2
+  Mac's EBS volume. Keep states on the internal SSD.
 
 ## Upgrading from v0.1
 

@@ -46,7 +46,7 @@ private final class BootstrapReply: @unchecked Sendable {
         var timeout = timeval(tv_sec: 5, tv_usec: 0)
         guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout.size(ofValue: noSignal))) == 0,
               setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout))) == 0,
-              let data = try? bootstrapPayload(path) else { return }
+              let data = (try? bootstrapPayload(path)).map(stamped) else { return }
         data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
