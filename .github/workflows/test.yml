@@ -18,6 +18,8 @@ jobs:
         run: swift test
       - name: Build arm64 runtime
         run: swift build -c release --arch arm64
+      - name: Sign ad hoc with the virtualization entitlement
+        run: Scripts/sign.sh .build/arm64-apple-macosx/release/runs-on-vz
       - name: Test process recovery without starting VMs
         run: |
           swiftc Sources/runs-on-vz/ProcessIdentity.swift Sources/runs-on-vz/RunResult.swift Scripts/process-identity-smoke.swift -o "$RUNNER_TEMP/process-identity-smoke"

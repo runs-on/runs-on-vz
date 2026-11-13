@@ -151,13 +151,25 @@ Build on Apple Silicon with macOS 14 or newer:
 swift build -c release --arch arm64
 ```
 
-Release binaries are unsigned. The RunsOn host agent applies an ad-hoc
-signature with the virtualization entitlement before first use.
+Virtualization.framework requires its caller to hold the
+`com.apple.security.virtualization` entitlement. Sign a local build ad hoc
+with it (no certificate needed):
 
-The release workflow reruns unit, process and lifecycle checks before publishing
-the arm64 binary and its SHA-256 file. Tags containing a prerelease suffix,
-such as `v0.2.0-rc.1`, publish a prerelease without changing the latest stable
-release. Publication requires an existing remote tag.
+```bash
+Scripts/sign.sh .build/arm64-apple-macosx/release/runs-on-vz
+```
+
+Release binaries are signed this way already, and the signature travels with
+the binary: a host downloads `runs-on-vz-darwin-arm64`, checks it against its
+SHA-256 file and runs it. They are not notarized, so download them with a
+tool that sets no quarantine attribute (`curl`), not a browser.
+
+The release workflow reruns unit, process and lifecycle checks on the signed
+binary before publishing it and its SHA-256 file. Run it on `main` with the
+version to release (Actions, Release, Run workflow): it creates the tag.
+Pushing a `v*` tag releases that tag instead. Versions with a prerelease
+suffix, such as `v0.2.0-rc.1`, publish a prerelease without changing the
+latest stable release. A version is never published twice.
 
 ## Tests
 

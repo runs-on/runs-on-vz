@@ -1,9 +1,17 @@
 name: Release
 
+# A release is a tag pushed by hand, or this workflow run by hand on main
+# with the version to release: it then creates the tag itself.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release from main, such as v0.2.0 (creates the tag)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,14 +20,36 @@ jobs:
   release:
     runs-on: macos-15
     timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+      - name: Check the version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::version '$VERSION': want vX.Y.Z or vX.Y.Z-suffix"
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+              echo "::error::run this workflow on main, not $GITHUB_REF_NAME"
+              exit 1
+            fi
+            if [[ -n "$(git ls-remote --tags origin "refs/tags/$VERSION")" ]]; then
+              echo "::error::tag $VERSION exists already: a release is never published again"
+              exit 1
+            fi
+          fi
       - name: Test
         run: swift test
       - name: Build arm64 release
         run: swift build -c release --arch arm64
       - name: Verify architecture
         run: file .build/arm64-apple-macosx/release/runs-on-vz | grep -q 'arm64'
+      - name: Sign ad hoc with the virtualization entitlement
+        run: Scripts/sign.sh .build/arm64-apple-macosx/release/runs-on-vz
       - name: Test process recovery without starting VMs
         run: |
           swiftc Sources/runs-on-vz/ProcessIdentity.swift Sources/runs-on-vz/RunResult.swift Scripts/process-identity-smoke.swift -o "$RUNNER_TEMP/process-identity-smoke"
@@ -31,13 +61,20 @@ jobs:
       - name: Package
         run: |
           cp .build/arm64-apple-macosx/release/runs-on-vz runs-on-vz-darwin-arm64
+          codesign --verify --strict runs-on-vz-darwin-arm64
           shasum -a 256 runs-on-vz-darwin-arm64 > runs-on-vz-darwin-arm64.sha256
-      - name: Publish unsigned binary
+          cat runs-on-vz-darwin-arm64.sha256 >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=(--verify-tag --generate-notes)
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          flags=(--generate-notes)
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            flags+=(--target "$GITHUB_SHA") # creates the tag
+          else
+            flags+=(--verify-tag)
+          fi
+          if [[ "$VERSION" == *-* ]]; then
             flags+=(--prerelease --latest=false)
           fi
-          gh release create "$GITHUB_REF_NAME" runs-on-vz-darwin-arm64 runs-on-vz-darwin-arm64.sha256 "${flags[@]}"
+          gh release create "$VERSION" runs-on-vz-darwin-arm64 runs-on-vz-darwin-arm64.sha256 "${flags[@]}"
